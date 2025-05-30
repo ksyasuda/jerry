@@ -65,6 +65,8 @@ usage() {
       Edit config file using an editor defined with jerry_editor in the config (\$EDITOR by default). If a config file does not exist, creates one with a default configuration
     -d, --discord
       Display currently watching anime in Discord Rich Presence (jerrydiscordpresence.py is required for this, check the wiki for instructions on how to install it)
+    -D, --download-to-tmp
+      Download video to temporary directory before playing
     -h, --help
       Show this help message and exit
     -i, --image-preview
@@ -131,6 +133,7 @@ configuration() {
     [ -z "$discord_presence" ] && discord_presence="false"
     [ -z "$presence_script_path" ] && presence_script_path="jerrydiscordpresence.py"
     [ -z "$rofi_prompt_config" ] && rofi_prompt_config="$HOME/.config/rofi/config.rasi"
+    [ -z "$download_to_tmp" ] && download_to_tmp=false
     if [ -z "$chafa_options" ]; then
         case "$(uname -s)" in
             MINGW* | *Msys) chafa_options="-f symbols" ;;
@@ -1176,6 +1179,102 @@ add_to_history() {
     fi
 }
 
+download_video() {
+    video_url="$1"
+    output_file="$2"
+
+    mkdir -p "$tmp_dir/downloads"
+    rm -f "$output_file"
+
+    if command -v aria2c >/dev/null 2>&1; then
+        case "$video_url" in
+            *".m3u8"*)
+                ffmpeg -i "$video_url" -c copy -f mp4 -movflags +faststart -y "$output_file" 2>/dev/null &
+                ;;
+            *)
+                aria2c --allow-overwrite=true \
+                    --auto-file-renaming=false \
+                    --max-connection-per-server=16 \
+                    --min-split-size=1M \
+                    --max-concurrent-downloads=1 \
+                    --file-allocation=none \
+                    --no-conf \
+                    --remote-time=false \
+                    --conditional-get=false \
+                    --summary-interval=1 \
+                    --dir="$(dirname "$output_file")" \
+                    --out="$(basename "$output_file")" \
+                    "$video_url" > "$tmp_dir/aria2c.log" 2>&1 &
+                ;;
+        esac
+        download_pid=$!
+    else
+        case "$video_url" in
+            *".m3u8"*)
+                ffmpeg -i "$video_url" -c copy -f mp4 -movflags +faststart -y "$output_file" 2>/dev/null &
+                ;;
+            *)
+                curl -L -C - -o "$output_file" "$video_url" > "$tmp_dir/curl.log" 2>&1 &
+                ;;
+        esac
+        download_pid=$!
+    fi
+
+    # Wait a moment for the download to start
+    sleep 1
+
+    # Check if the process is still running
+    if ! kill -0 $download_pid 2>/dev/null; then
+        send_notification "Error" "3000" "" "Download process failed to start"
+        if [ -f "$tmp_dir/aria2c.log" ]; then
+            send_notification "Debug" "3000" "" "aria2c log: $(cat "$tmp_dir/aria2c.log")"
+        fi
+        if [ -f "$tmp_dir/curl.log" ]; then
+            send_notification "Debug" "3000" "" "curl log: $(cat "$tmp_dir/curl.log")"
+        fi
+        cleanup_video
+        exit 1
+    fi
+
+    # Wait for the file to be created
+    timeout=10
+    while [ ! -f "$output_file" ] && [ $timeout -gt 0 ]; do
+        sleep 1
+        timeout=$((timeout - 1))
+    done
+
+    if [ ! -f "$output_file" ]; then
+        send_notification "Error" "3000" "" "Failed to create video file"
+        if [ -f "$tmp_dir/aria2c.log" ]; then
+            send_notification "Debug" "3000" "" "aria2c log: $(cat "$tmp_dir/aria2c.log")"
+        fi
+        if [ -f "$tmp_dir/curl.log" ]; then
+            send_notification "Debug" "3000" "" "curl log: $(cat "$tmp_dir/curl.log")"
+        fi
+        cleanup_video
+        exit 1
+    fi
+
+    # Check if the file is growing (download is progressing)
+    initial_size=$(stat -f%z "$output_file" 2>/dev/null || stat -c%s "$output_file" 2>/dev/null)
+    sleep 2
+    current_size=$(stat -f%z "$output_file" 2>/dev/null || stat -c%s "$output_file" 2>/dev/null)
+
+    if [ "$initial_size" = "$current_size" ]; then
+        send_notification "Error" "3000" "" "Download is not progressing"
+        if [ -f "$tmp_dir/aria2c.log" ]; then
+            send_notification "Debug" "3000" "" "aria2c log: $(cat "$tmp_dir/aria2c.log")"
+        fi
+        if [ -f "$tmp_dir/curl.log" ]; then
+            send_notification "Debug" "3000" "" "curl log: $(cat "$tmp_dir/curl.log")"
+        fi
+        cleanup_video
+        exit 1
+    fi
+
+    return $download_pid
+}
+
 play_video() {
     case "$provider" in
         aniwatch) displayed_title="$title - Ep $((progress + 1)) $episode_title" ;;
@@ -1184,6 +1283,33 @@ play_video() {
         aniworld) displayed_title="$episode_title" ;;
         *) displayed_title="$title - Ep $((progress + 1))" ;;
     esac
+
+    if [ "$download_to_tmp" = true ]; then
+        temp_video="$tmp_dir/downloads/${media_id}_ep${progress}.mp4"
+
+        # Function to clean up on exit
+        cleanup_video() {
+            kill $download_pid 2>/dev/null
+            rm -f "$temp_video"
+            rm -f "$tmp_dir/aria2c.log" "$tmp_dir/curl.log"
+        }
+
+        # Ensure cleanup happens on script exit
+        trap cleanup_video EXIT INT TERM
+
+        # Start the download
+        send_notification "Starting video download..." "3000" "$images_cache_dir/$media_id.jpg" "$title"
+        download_video "$video_link" "$temp_video"
+        download_pid=$!
+
+        # Wait just a moment for the file to start downloading
+        sleep 1
+
+        video_to_play="$temp_video"
+    else
+        video_to_play="$video_link"
+    fi
+
     case $player in
         mpv | mpv.exe)
             if [ -f "$history_file" ] && [ -z "$using_number" ]; then
@@ -1198,29 +1324,48 @@ play_video() {
                 opts="$opts --start=${resume_from}"
                 send_notification "Resuming from" "" "" "$resume_from"
             fi
+
+            # Add cache settings for better streaming
+            opts="$opts --cache=yes --cache-secs=30 --stream-buffer-size=50M"
+
             if [ -n "$subs_links" ]; then
                 send_notification "$title" "4000" "$images_cache_dir/$media_id.jpg" "$title"
                 if [ "$discord_presence" = "true" ]; then
-                    eval "$presence_script_path" \"$player\" \"${title}\" \"${start_year}\" \"$((progress + 1))\" \"${video_link}\" \"${subs_links}\" ${opts} 2>&1 | tee $tmp_position
+                    eval "$presence_script_path" \"$player\" \"${title}\" \"${start_year}\" \"$((progress + 1))\" \"${video_to_play}\" \"${subs_links}\" ${opts} 2>&1 | tee $tmp_position
                 else
-                    $player "$video_link" $opts "$subs_arg" "$subs_links" --force-media-title="$displayed_title" --msg-level=ffmpeg/demuxer=error 2>&1 | tee $tmp_position
+                    $player "$video_to_play" $opts "$subs_arg" "$subs_links" --force-media-title="$displayed_title" --msg-level=ffmpeg/demuxer=error 2>&1 | tee $tmp_position
                 fi
             else
                 send_notification "$title" "4000" "$images_cache_dir/$media_id.jpg" "$title"
                 if [ "$discord_presence" = "true" ]; then
-                    eval "$presence_script_path" \"$player\" \"${title}\" \"${start_year}\" \"$((progress + 1))\" \"${video_link}\" \"\" ${opts} 2>&1 | tee $tmp_position
+                    eval "$presence_script_path" \"$player\" \"${title}\" \"${start_year}\" \"$((progress + 1))\" \"${video_to_play}\" \"\" ${opts} 2>&1 | tee $tmp_position
                 else
-                    $player "$video_link" $opts --force-media-title="$displayed_title" --msg-level=ffmpeg/demuxer=error 2>&1 | tee $tmp_position
+                    $player "$video_to_play" $opts --force-media-title="$displayed_title" --msg-level=ffmpeg/demuxer=error 2>&1 | tee $tmp_position
                 fi
             fi
             stopped_at=$($sed -nE "s@.*AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\).*@\1@p" "$tmp_position" | tail -1)
             percentage_progress=$($sed -nE "s@.*AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\).*@\3@p" "$tmp_position" | tail -1)
+
+            [ "$download_to_tmp" = true ] && cleanup_video
+
             add_to_history
             ;;
-        *yncpla*) syncplay "$video_link" -- --force-media-title="${title}" >/dev/null 2>&1 ;;
-        vlc) vlc --play-and-exit --meta-title="${title}" "$video_link" >/dev/null 2>&1 & ;;
-        iina) iina --no-stdin --keep-running --mpv-force-media-title="${title}" "$video_link" >/dev/null 2>&1 & ;;
+        *yncpla*)
+            syncplay "$video_to_play" -- --force-media-title="${title}" >/dev/null 2>&1
+            [ "$download_to_tmp" = true ] && cleanup_video
+            ;;
+        vlc)
+            vlc --play-and-exit --meta-title="${title}" "$video_to_play" >/dev/null 2>&1 &
+            wait $!
+            [ "$download_to_tmp" = true ] && cleanup_video
+            ;;
+        iina)
+            iina --no-stdin --keep-running --mpv-force-media-title="${title}" "$video_to_play" >/dev/null 2>&1 &
+            wait $!
+            [ "$download_to_tmp" = true ] && cleanup_video
+            ;;
     esac
+
     if [ "$player" != "mpv" ] && [ "$player" != "mpv.exe" ]; then
         completed_episode=$(printf "Yes\nNo" | launcher "Have you completed watching this episode? [Y/n] ")
         case "$completed_episode" in
@@ -1483,6 +1628,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -d | --discord) discord_presence=true && shift ;;
+        -D | --download-to-tmp) download_to_tmp=true && shift ;;
         --dub) sub_or_dub="dub" && shift ;;
         -e | --edit) edit_configuration ;;
         -h | --help)
